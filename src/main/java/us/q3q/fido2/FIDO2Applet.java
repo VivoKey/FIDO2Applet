@@ -310,10 +310,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * Ever-increasing number representing how many sig operations we've made
      */
     private final SigOpCounter counter;
-    /**
-     * Value that decreases with each failed PIN guess
-     */
-    private final PinRetryCounter pinRetryCounter;
 
     // Parameters for the real elliptic-curve keys :-)
     /**
@@ -5433,7 +5429,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             }
         }
 
-        final short pinIdx = pinRetryCounter.prepareIndex();
         final byte tempBlobStoreIndex = (byte)(largeBlobStoreIndex == 0 ? 1 : 0);
 
         // Empty the large blob store OUTside the main transaction, since it's non-precious and double buffered
@@ -5481,7 +5476,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             forcePinChange = false;
             alwaysUv = FORCE_ALWAYS_UV;
             enterpriseAttestation = false;
-            pinRetryCounter.reset(pinIdx);
             Util.arrayFillNonAtomic(minPinRPIDs, (short) 0, (short) (MAX_RP_IDS_MIN_PIN_LENGTH * RP_HASH_LEN), (byte) 0x00);
 
             random.generateData(pinKDFSalt, (short) 0, (short) pinKDFSalt.length);
@@ -6131,11 +6125,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param pinPermissions Bitfield representing permissions to be associated with the PIN if correct
      */
     private void testAndReadyPIN(APDU apdu, byte[] buf, short off, byte pinProtocol, byte pinPermissions) {
-        short pinRetryIndex = pinRetryCounter.prepareIndex();
-        if (pinRetryCounter.getRetryCount(pinRetryIndex) <= 0) {
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_BLOCKED);
-        }
-
         if (transientStorage.getPinTriesSinceReset() >= PIN_TRIES_PER_RESET) {
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_AUTH_BLOCKED);
         }
@@ -6168,13 +6157,11 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         // counter. So we'll accept the risk that a good PIN still results in the counter going down
         // in the event of a strange failure.
         transientStorage.incrementPinTriesSinceReset();
-        pinRetryCounter.decrement(pinRetryIndex);
 
         // ... and check that the result equals the second 32 bytes. If it does, we have the correct key.
         if (Util.arrayCompare(wrappingKeyValidation, (short) 32,
                 keyBuf, validationOff, (short) 32) == 0) {
             // Good PIN!
-            pinRetryCounter.reset(pinRetryIndex);
             transientStorage.setPinProtocolInUse(pinProtocol, pinPermissions);
             highSecurityWrappingKey.setKey(keyBuf, keyOff);
             transientStorage.clearPinTriesSinceReset();
@@ -6185,11 +6172,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         // BAD PIN
         highSecurityWrappingKey.clearKey();
         forceInitKeyAgreementKey();
-        if (pinRetryCounter.getRetryCount(pinRetryIndex) == 0) {
-            // You've gone and done it now. You've failed so many times that the authenticator will permanently lock itself.
-            resetWrappingKeys(apdu); // there won't be a situation where we can use this again, so clear it for safety
-            sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_BLOCKED);
-        }
         if (transientStorage.getPinTriesSinceReset() >= PIN_TRIES_PER_RESET) {
             // The authenticator isn't permanently blocked, but it will need to be powered off before trying again
             sendErrorByte(apdu, FIDOConstants.CTAP2_ERR_PIN_AUTH_BLOCKED);
@@ -6561,8 +6543,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
             if (STORE_PIN_LENGTH) {
                 pinCodePointLength = newPinCodePointLength;
             }
-            short pinIdx = pinRetryCounter.prepareIndex();
-            pinRetryCounter.reset(pinIdx);
 
             // Encrypt the wrapping key with the PIN key
             pinWrapper.doFinal(wrappingKeySpace, (short) 0, (short) wrappingKeySpace.length,
@@ -6664,14 +6644,12 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
      * @param apdu The request/response object
      */
     private void handleClientPinGetRetries(APDU apdu) {
-        short pinIdx = pinRetryCounter.prepareIndex();
-
         byte[] outBuf = apdu.getBuffer();
         short outputLen = 0;
         outBuf[outputLen++] = FIDOConstants.CTAP2_OK;
         outBuf[outputLen++] = (byte) 0xA2; // map - two entries
         outBuf[outputLen++] = 0x03; // map key: retries
-        outBuf[outputLen++] = pinRetryCounter.getRetryCount(pinIdx);
+        outBuf[outputLen++] = 0x08; // pin retry counter: always a static value to not cause alarm
         outBuf[outputLen++] = 0x04; // map key: powerCycleState
         outBuf[outputLen++] = (byte) (transientStorage.getPinTriesSinceReset() >= PIN_TRIES_PER_RESET
                 ? 0xF5 : 0xF4); // true or false
@@ -6982,7 +6960,6 @@ public final class FIDO2Applet extends Applet implements ExtendedLength {
         numResidentRPs = 0;
         resetRequested = false;
         counter = new SigOpCounter();
-        pinRetryCounter = new PinRetryCounter(MAX_PIN_RETRIES);
         pinCodePointLength = 0;
 
         // Trivial amounts of flash, object allocations without buffers
